@@ -98,7 +98,7 @@
                inset 0 1px 0 rgba(255,255,255,.3)}
   .btn:focus-visible{outline:3px solid #e8b84b;outline-offset:3px}
 
-  .audio-status{font-size:12px;color:#a89575;margin-top:14px;min-height:14px;letter-spacing:.01em}
+  .audio-status{font-size:12px;color:#a89575;margin-top:14px;min-height:14px;letter-spacing:.01em;line-height:1.5}
 
   .mini-hen{display:block;margin:0 auto 4px;width:110px;height:130px}
   .hintring{pointer-events:none;transform-box:fill-box;transform-origin:center;
@@ -177,13 +177,14 @@
 
 <script>
 /* ============================================================
-   ОЗВУЧКА — просто положите файлы в папку audio/ рядом с index.html.
-   Игра при запуске проверит каждый ключ по расширениям (mp3 → ogg → wav).
-   Найденный файл играет вместо синтезированного звука.
-   Никаких настроек, кнопок загрузки и хранилищ — только файлы.
+   ОЗВУЧКА — просто положите файлы рядом с index.html
+   (или в подпапку audio/ или sound/).
+   Игра при запуске сама найдёт их по имени.
+   Поддерживаются расширения: mp3, wav, ogg, m4a.
+   Если файл не найден — включится синтез.
    ============================================================ */
-const AUDIO_DIR = 'audio';
-const AUDIO_EXTS = ['mp3', 'ogg', 'wav'];
+const AUDIO_DIRS = ['', 'audio/', 'sound/'];
+const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'm4a'];
 const NARRATION_VOL = 0.95;
 const EFFECTS_VOL   = 0.85;
 
@@ -192,43 +193,79 @@ const AUDIO_KEYS = [
   'cluck','knock','sparkle','crash','squeak','sad','happy','pop','clink','whoosh'
 ];
 
-/* найденные URL: key -> строка (есть файл) | null (нет) */
+/* найденные URL: key -> строка | null */
 const detectedUrls = {};
+let audioProbeDone = false;
 
 /* ---------- состояние звука ---------- */
 let muted = false;
 let currentNarration = null;
 try { muted = localStorage.getItem('ryaba-muted') === '1'; } catch(e){}
 
-/* ---------- probe: проверяем, есть ли файл ---------- */
-function probeAudio(urls){
-  return new Promise(resolve => {
-    let i = 0;
-    function tryNext(){
-      if(i >= urls.length){ resolve(null); return; }
-      const url = urls[i];
-      const a = new Audio();
-      let done = false;
-      const finish = ok => {
-        if(done) return;
-        done = true;
-        a.oncanplaythrough = a.onerror = null;
-        try { a.src = ''; a.load(); } catch(e){}
-        if(ok) resolve(url);
-        else { i++; tryNext(); }
-      };
-      a.preload = 'auto';
-      a.oncanplaythrough = () => finish(true);
-      a.onerror = () => finish(false);
-      try { a.src = url; a.load(); } catch(e){ finish(false); return; }
-      setTimeout(() => finish(false), 2500);
+/* ---------- пробинг: параллельно пробуем все варианты, резолвим на первом успехе ---------- */
+function buildUrls(key){
+  const urls = [];
+  for(const dir of AUDIO_DIRS){
+    for(const ext of AUDIO_EXTS){
+      urls.push(`${dir}${key}.${ext}`);
     }
-    tryNext();
-  });
+  }
+  return urls;
 }
 
-function buildUrls(key){
-  return AUDIO_EXTS.map(ext => `${AUDIO_DIR}/${key}.${ext}`);
+function probeAudio(urls){
+  return new Promise(resolve => {
+    let remaining = urls.length;
+    let settled = false;
+    const audios = [];
+
+    function abortAll(){
+      for(const a of audios){
+        try {
+          a.oncanplaythrough = null;
+          a.onerror = null;
+          a.removeAttribute('src');
+          a.load();
+        } catch(e){}
+      }
+    }
+
+    for(const url of urls){
+      const a = new Audio();
+      audios.push(a);
+      let done = false;
+
+      const settle = (ok) => {
+        if(done) return;
+        done = true;
+        a.oncanplaythrough = null;
+        a.onerror = null;
+
+        if(settled) return;
+
+        if(ok){
+          settled = true;
+          abortAll();
+          resolve(url);
+        } else {
+          remaining--;
+          if(remaining === 0){
+            settled = true;
+            resolve(null);
+          }
+        }
+      };
+
+      a.preload = 'auto';
+      a.oncanplaythrough = () => settle(true);
+      a.onerror = () => settle(false);
+
+      try { a.src = url; a.load(); }
+      catch(e){ settle(false); continue; }
+
+      setTimeout(() => settle(false), 2500);
+    }
+  });
 }
 
 let audioProbePromise = null;
@@ -237,19 +274,41 @@ function initAudioProbe(){
     AUDIO_KEYS.map(async key => {
       detectedUrls[key] = await probeAudio(buildUrls(key));
     })
-  ).then(updateAudioIndicator);
+  ).then(() => {
+    audioProbeDone = true;
+    updateAudioIndicator();
+    logAudioSummary();
+  });
   return audioProbePromise;
+}
+
+function logAudioSummary(){
+  const found = {}, missing = [];
+  for(const key of AUDIO_KEYS){
+    if(detectedUrls[key]) found[key] = detectedUrls[key];
+    else missing.push(key);
+  }
+  console.group('[Курочка Ряба] Проверка звуков');
+  if(Object.keys(found).length){
+    console.log('✓ Найдены файлы:');
+    for(const [k,v] of Object.entries(found)) console.log('  ', k, '→', v);
+  }
+  if(missing.length){
+    console.warn('✗ Не найдены (будет синтез):', missing.join(', '));
+  }
+  console.groupEnd();
 }
 
 function updateAudioIndicator(){
   const el = document.getElementById('audioStatus');
   if(!el) return;
-  const found = Object.values(detectedUrls).filter(Boolean).length;
   const total = AUDIO_KEYS.length;
+  const found = Object.values(detectedUrls).filter(Boolean).length;
   if(found === 0){
-    el.textContent = 'Звуковые файлы не найдены — используется встроенный синтез';
+    el.textContent = 'Звуковые файлы не найдены — используется встроенный синтез. Проверьте имена и папку (см. консоль F12).';
+    el.style.color = '#b5734a';
   } else if(found === total){
-    el.textContent = `Найдено звуковых файлов: все ${total}`;
+    el.textContent = `Найдены все ${total} звуковых файлов`;
     el.style.color = '#8a6a44';
   } else {
     el.textContent = `Найдено звуковых файлов: ${found} из ${total}`;
@@ -275,16 +334,27 @@ function duckNarration(){
 async function playNarration(i){
   stopNarration();
   if(muted) return;
-  try { await Promise.race([audioProbePromise, new Promise(r => setTimeout(r, 2000))]); } catch(e){}
+
+  // если проба ещё не завершена — подождём немного
+  if(!audioProbeDone && detectedUrls['narration-1'] === undefined){
+    try { await Promise.race([audioProbePromise, new Promise(r => setTimeout(r, 1800))]); } catch(e){}
+  }
   if(muted) return;
   if(current !== i) return;
+
   const url = detectedUrls['narration-' + (i + 1)];
-  if(!url) return;
+  if(!url){
+    console.warn(`[Курочка Ряба] narration-${i + 1}: файл не найден`);
+    return;
+  }
   const a = new Audio(url);
   a.volume = NARRATION_VOL;
   currentNarration = a;
   const p = a.play();
-  if(p && p.catch) p.catch(() => { if(currentNarration === a) currentNarration = null; });
+  if(p && p.catch) p.catch(err => {
+    console.warn(`[Курочка Ряба] Не удалось воспроизвести narration-${i + 1}:`, err.message);
+    if(currentNarration === a) currentNarration = null;
+  });
 }
 function playFile(key){
   if(muted) return true;
@@ -318,7 +388,7 @@ function setMuted(m){
 }
 
 /* ============================================================
-   СИНТЕЗ — запасной звук, играет только если файла нет
+   СИНТЕЗ — запасной звук
    ============================================================ */
 let AC = null;
 function actx(){
@@ -1223,6 +1293,76 @@ function updateDots(){
   });
 }
 
+function render(i){
+  const sc = scenes[i]();
+  current = i;
+
+  stageEl.innerHTML =
+    `<svg class="scene-svg" viewBox="0 0 800 480"
+          preserveAspectRatio="xMidYMid meet"
+          xmlns="http://www.w3.org/2000/svg">${sc.html}</svg>`;
+
+  captionEl.textContent = sc.text;
+  hintEl.textContent = sc.hint || '';
+  hintEl.style.visibility = sc.hint ? 'visible' : 'hidden';
+  updateDots();
+
+  setTimeout(() => {
+    if(current === i) playNarration(i);
+  }, 350);
+
+  const svg = stageEl.querySelector('svg');
+  sc.init(svg, () => goTo(i + 1));
+}
+
+function goTo(i){
+  if(i >= scenes.length){ finish(); return; }
+  stageEl.style.opacity = '0';
+  captionEl.style.opacity = '0';
+  hintEl.style.opacity = '0';
+  setTimeout(() => {
+    render(i);
+    stageEl.style.opacity = '1';
+    captionEl.style.opacity = '1';
+    hintEl.style.opacity = '1';
+  }, 270);
+}
+
+function finish(){
+  current = scenes.length - 1;
+  updateDots();
+  dotEls.forEach(d => { d.className = 'dot done'; });
+  stopNarration();
+  endOv.classList.remove('hidden');
+}
+
+function startGame(){
+  try { actx(); } catch(e){}
+  stopNarration();
+  startOv.classList.add('hidden');
+  endOv.classList.add('hidden');
+  stageEl.style.opacity = '1';
+  captionEl.style.opacity = '1';
+  hintEl.style.opacity = '1';
+  render(0);
+}
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('againBtn').addEventListener('click', startGame);
+document.getElementById('muteBtn').addEventListener('click', () => setMuted(!muted));
+
+document.querySelector('.mini-hen').innerHTML = hen();
+
+stageEl.style.transition   = 'opacity .26s ease';
+captionEl.style.transition = 'opacity .26s ease';
+hintEl.style.transition    = 'opacity .26s ease';
+hintEl.style.visibility = 'hidden';
+
+updateMuteBtn();
+initAudioProbe();
+</script>
+</body>
+</html>
 function render(i){
   const sc = scenes[i]();
   current = i;
